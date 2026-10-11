@@ -32,6 +32,40 @@ let watchdogTimer = null
 let userMuted = false
 let handoffFadeTimer = null
 
+const probeBuffer = []
+
+const pushProbe = (marker, ap) => {
+  const a = ap?.audio
+  probeBuffer.push({
+    t: Math.round(Date.now() % 1e6 / 100) / 10,
+    m: marker,
+    idx: ap?.list?.index,
+    vol: a ? +a.volume.toFixed(2) : null,
+    pau: a ? a.paused : null,
+    end: a ? a.ended : null,
+    rs: a ? a.readyState : null,
+    cf: isCrossfading ? 1 : 0,
+    ho: isHandingOff ? 1 : 0,
+    cfa: crossfadeAudio ? 1 : 0,
+    hfa: handoffAudio ? 1 : 0,
+    pre: preloadedForIndex,
+    vis: document.visibilityState,
+    pb: navigator.mediaSession ? navigator.mediaSession.playbackState : '-'
+  })
+  if (probeBuffer.length > 200) probeBuffer.shift()
+}
+
+if (typeof window !== 'undefined' && !window.__mikuDump) {
+  window.__mikuDump = () => JSON.stringify(probeBuffer)
+  window.addEventListener('keydown', (e) => {
+    if (e.altKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
+      const text = window.__mikuDump()
+      if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).catch(() => { })
+      console.log('[useCrossfade] 诊断已复制', probeBuffer.length, '条')
+    }
+  })
+}
+
 export const useCrossfade = () => {
   const toggleCrossfade = (val) => {
     crossfadeEnabled.value = val
@@ -134,9 +168,11 @@ export const useCrossfade = () => {
     ap.events.trigger = (event, data) => {
       const loop = getLoopMode(ap)
       if (event === 'ended' && isCrossfading && loop !== 'one') {
+        pushProbe('ev:ended->handoff', ap)
         handleCrossfadeEnd(ap, onMediaSessionSync)
         return
       }
+      if (event === 'ended') pushProbe('ev:ended-pass', ap)
       origTrigger(event, data)
     }
   }
@@ -148,13 +184,19 @@ export const useCrossfade = () => {
       const main = ap.audio
       const nextUrl = nextAudio?.url
       const progBusy = isCrossfading || isHandingOff || !!handoffAudio || isSwapping
-      if (!seamlessEnabled() || progBusy || !main || main.paused || !nextUrl) {
+      const endedAdvance = !!(main && main.ended && getLoopMode(ap) === 'all')
+      if (!seamlessEnabled() || progBusy || !main || (!endedAdvance && main.paused) || !nextUrl) {
+        pushProbe(endedAdvance ? 'set:ended-blocked' : 'set:orig', ap)
         origSetAudio(nextAudio)
         return
       }
       const canSeamless = seamlessReadyAudio && seamlessReadyUrl === nextUrl && seamlessReadyAudio.readyState >= 2
       if (!canSeamless) {
-        if (startOverlapSwitch(ap, nextAudio, onMediaSessionSync)) return
+        if (startOverlapSwitch(ap, nextAudio, onMediaSessionSync, endedAdvance)) {
+          pushProbe(endedAdvance ? 'set:ov-immediate' : 'set:overlap', ap)
+          return
+        }
+        pushProbe('set:orig', ap)
         origSetAudio(nextAudio)
         return
       }
@@ -232,7 +274,9 @@ export const useCrossfade = () => {
     if (overlapPreSwitchedAudio) {
       const pre = overlapPreSwitchedAudio
       overlapPreSwitchedAudio = null
-      origSetAudio(pre)
+      let abs = pre.url
+      try { abs = new URL(pre.url, window.location.href).href } catch (e) { }
+      if (ap.audio.src !== abs) origSetAudio(pre)
     } else {
       isCrossfadeListSwitch = true
       ap.list.switch(nextIdx)
@@ -282,6 +326,13 @@ export const useCrossfade = () => {
           const pp = ap.play()
           if (pp && pp.catch) pp.catch(() => { })
         } catch (e) { }
+      }
+      if (document.visibilityState !== 'visible') {
+        pushProbe('ev:minifade-instant', ap)
+        setPlayerVolume(ap, lastGoodVolume)
+        handoffAudio.volume = 0
+        finishHandoff()
+        return
       }
       const startVol = handoffAudio.volume
       const start = Date.now()
@@ -337,7 +388,7 @@ export const useCrossfade = () => {
     }
 
     handoffFallbackTimer = setTimeout(() => finishHandoff(), 7000)
-    setTimeout(armHandoff, 0)
+    armHandoff()
   }
   const beginFade = (ap, durationMs) => {
     clearFadeAnim()
@@ -395,9 +446,12 @@ export const useCrossfade = () => {
     }
     crossfadeAudio.currentTime = 0
     crossfadeAudio.volume = clampVolume(lastGoodVolume * 0.5)
-    crossfadeAudio.play().catch(() => {
+    const cfP = crossfadeAudio.play()
+    if (cfP && cfP.catch) cfP.catch(() => {
+      pushProbe('ev:cf-reject', ap)
       cleanup(ap, onMediaSessionSync)
     })
+    if (cfP && cfP.then) cfP.then(() => pushProbe('ev:cf-ok', ap))
 
     const duration = Math.max(0.2, Math.min(CROSSFADE_DURATION, remaining)) * 1000
     beginFade(ap, duration)
@@ -408,22 +462,21 @@ export const useCrossfade = () => {
     }, duration + 1200)
   }
 
-  const startOverlapSwitch = (ap, nextAudio, onMediaSessionSync) => {
+  const startOverlapSwitch = (ap, nextAudio, onMediaSessionSync, immediate = false) => {
     const main = ap.audio
     const idx = ap.list.audios.indexOf(nextAudio)
-    if (idx === -1 || !nextAudio.url || !main || main.paused || ap.list.audios.length <= 1) return false
+    if (idx === -1 || !nextAudio.url || !main || ap.list.audios.length <= 1) return false
+    if (main.paused && !main.ended) return false
+    if (main.ended && getLoopMode(ap) !== 'all') return false
 
     let el = null
-    let preloaded = false
     if (seamlessReadyAudio && seamlessReadyUrl === nextAudio.url) {
       el = seamlessReadyAudio
       destroySeamlessReady()
-      preloaded = true
     } else if (preloadedAudioEl && preloadedForIndex === idx) {
       el = preloadedAudioEl
       preloadedAudioEl = null
       preloadedForIndex = -1
-      preloaded = true
     }
     if (!el) {
       destroyPreloadedAudio()
@@ -440,26 +493,40 @@ export const useCrossfade = () => {
     crossfadeAudio = el
     try { el.currentTime = 0 } catch (e) { }
     el.volume = clampVolume(lastGoodVolume * 0.5)
+    const start = Date.now()
     const p = el.play()
-    if (p && p.catch) p.catch(() => { })
+    if (p && p.catch) p.catch(() => { pushProbe('ev:ov-reject', ap) })
+    if (p && p.then) p.then(() => pushProbe('ev:ov-ok', ap))
 
-    const fadeMs = MANUAL_FADE_SEC * 1000
-    beginFade(ap, fadeMs)
+    if (immediate) {
+      setPlayerVolume(ap, 0, 8000)
+      origSetAudio(nextAudio)
+    } else {
+      const fadeMs = MANUAL_FADE_SEC * 1000
+      beginFade(ap, fadeMs)
+    }
 
     const fire = () => {
       clearCrossfadeEndFallback()
-      if (isCrossfading && crossfadeAudio) handleCrossfadeEnd(ap, onMediaSessionSync)
+      if (!isCrossfading || !crossfadeAudio) return
+      const minWait = immediate ? 0 : MANUAL_FADE_SEC * 1000
+      if (Date.now() - start < minWait && document.visibilityState === 'visible') {
+        crossfadeEndFallbackTimer = setTimeout(fire, minWait - (Date.now() - start) + 100)
+        return
+      }
+      handleCrossfadeEnd(ap, onMediaSessionSync)
     }
-    if (!preloaded) {
-      el.addEventListener('playing', () => setTimeout(fire, 150), { once: true })
-    }
-    crossfadeEndFallbackTimer = setTimeout(fire, fadeMs + 500)
+    el.addEventListener('playing', fire, { once: true })
+    if (p && p.then) p.then(fire)
+    crossfadeEndFallbackTimer = setTimeout(fire, (immediate ? 0.5 : MANUAL_FADE_SEC + 0.5) * 1000)
     return true
   }
 
   const setupCrossfade = (ap, onMediaSessionSync) => {
     let crossfadeTriggered = false
     interceptSetAudio(ap, onMediaSessionSync)
+
+    setInterval(() => pushProbe('tick', ap), 250)
 
    ap.on('volumechange', () => {
       if (Date.now() < (ap._mikuSuppressVolumeSaveUntil || 0)) return
@@ -524,6 +591,22 @@ export const useCrossfade = () => {
       if (remaining > PRELOAD_LEAD_TIME) {
         destroyPreloadedAudio()
       }
+    })
+    ap.on('progress', () => {
+      if (!crossfadeEnabled.value || isCrossfading || handoffAudio || preloadedAudioEl || seamlessReadyAudio) return
+      const audio = ap.audio
+      if (!audio || !Number.isFinite(audio.duration) || audio.duration <= 0) return
+      const loop = getLoopMode(ap)
+      const idx = ap.nextIndex()
+      if (idx === undefined || idx === null || loop === 'one' || ap.list.audios.length <= 1) return
+      try {
+        const buf = audio.buffered
+        if (buf.length && buf.end(buf.length - 1) >= audio.duration - 15) {
+          preloadedAudioEl = new Audio(ap.list.audios[idx].url)
+          preloadedAudioEl.preload = 'auto'
+          preloadedForIndex = idx
+        }
+      } catch (e) { }
     })
 
     ap.on('listswitch', () => {
