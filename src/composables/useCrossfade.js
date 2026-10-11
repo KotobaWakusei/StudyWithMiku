@@ -4,7 +4,7 @@ import { cancelDuck } from '../utils/eventBus.js'
 const CROSSFADE_DURATION = 6
 const PRELOAD_LEAD_TIME = 20
 const CROSSFADE_KEY = 'crossfade_enabled'
-const MANUAL_FADE_SEC = 1.2
+const MANUAL_FADE_SEC = 1.5
 
 const crossfadeEnabled = ref(localStorage.getItem(CROSSFADE_KEY) !== 'false')
 
@@ -31,40 +31,6 @@ let overlapPreSwitchedAudio = null
 let watchdogTimer = null
 let userMuted = false
 let handoffFadeTimer = null
-
-const probeBuffer = []
-
-const pushProbe = (marker, ap) => {
-  const a = ap?.audio
-  probeBuffer.push({
-    t: Math.round(Date.now() % 1e6 / 100) / 10,
-    m: marker,
-    idx: ap?.list?.index,
-    vol: a ? +a.volume.toFixed(2) : null,
-    pau: a ? a.paused : null,
-    end: a ? a.ended : null,
-    rs: a ? a.readyState : null,
-    cf: isCrossfading ? 1 : 0,
-    ho: isHandingOff ? 1 : 0,
-    cfa: crossfadeAudio ? 1 : 0,
-    hfa: handoffAudio ? 1 : 0,
-    pre: preloadedForIndex,
-    vis: document.visibilityState,
-    pb: navigator.mediaSession ? navigator.mediaSession.playbackState : '-'
-  })
-  if (probeBuffer.length > 200) probeBuffer.shift()
-}
-
-if (typeof window !== 'undefined' && !window.__mikuDump) {
-  window.__mikuDump = () => JSON.stringify(probeBuffer)
-  window.addEventListener('keydown', (e) => {
-    if (e.altKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
-      const text = window.__mikuDump()
-      if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).catch(() => { })
-      console.log('[useCrossfade] 诊断已复制', probeBuffer.length, '条')
-    }
-  })
-}
 
 export const useCrossfade = () => {
   const toggleCrossfade = (val) => {
@@ -168,11 +134,9 @@ export const useCrossfade = () => {
     ap.events.trigger = (event, data) => {
       const loop = getLoopMode(ap)
       if (event === 'ended' && isCrossfading && loop !== 'one') {
-        pushProbe('ev:ended->handoff', ap)
         handleCrossfadeEnd(ap, onMediaSessionSync)
         return
       }
-      if (event === 'ended') pushProbe('ev:ended-pass', ap)
       origTrigger(event, data)
     }
   }
@@ -186,17 +150,12 @@ export const useCrossfade = () => {
       const progBusy = isCrossfading || isHandingOff || !!handoffAudio || isSwapping
       const endedAdvance = !!(main && main.ended && getLoopMode(ap) === 'all')
       if (!seamlessEnabled() || progBusy || !main || (!endedAdvance && main.paused) || !nextUrl) {
-        pushProbe(endedAdvance ? 'set:ended-blocked' : 'set:orig', ap)
         origSetAudio(nextAudio)
         return
       }
       const canSeamless = seamlessReadyAudio && seamlessReadyUrl === nextUrl && seamlessReadyAudio.readyState >= 2
       if (!canSeamless) {
-        if (startOverlapSwitch(ap, nextAudio, onMediaSessionSync, endedAdvance)) {
-          pushProbe(endedAdvance ? 'set:ov-immediate' : 'set:overlap', ap)
-          return
-        }
-        pushProbe('set:orig', ap)
+        if (startOverlapSwitch(ap, nextAudio, onMediaSessionSync, endedAdvance)) return
         origSetAudio(nextAudio)
         return
       }
@@ -328,7 +287,6 @@ export const useCrossfade = () => {
         } catch (e) { }
       }
       if (document.visibilityState !== 'visible') {
-        pushProbe('ev:minifade-instant', ap)
         setPlayerVolume(ap, lastGoodVolume)
         handoffAudio.volume = 0
         finishHandoff()
@@ -392,6 +350,8 @@ export const useCrossfade = () => {
   }
   const beginFade = (ap, durationMs) => {
     clearFadeAnim()
+    setPlayerVolume(ap, lastGoodVolume, 8000)
+    if (crossfadeAudio) crossfadeAudio.volume = 0
     const startTime = Date.now()
     const animate = () => {
       if (!isCrossfading) return
@@ -400,9 +360,9 @@ export const useCrossfade = () => {
         ? 2 * progress * progress
         : 1 - Math.pow(-2 * progress + 2, 2) / 2
 
-      setPlayerVolume(ap, lastGoodVolume * (1 - 0.5 * ease), 8000)
+      setPlayerVolume(ap, lastGoodVolume * (1 - ease), 8000)
       if (crossfadeAudio) {
-        crossfadeAudio.volume = clampVolume(lastGoodVolume * (0.5 + 0.5 * ease))
+        crossfadeAudio.volume = clampVolume(lastGoodVolume * ease)
       }
 
       if (progress >= 1) {
@@ -446,12 +406,9 @@ export const useCrossfade = () => {
     }
     crossfadeAudio.currentTime = 0
     crossfadeAudio.volume = clampVolume(lastGoodVolume * 0.5)
-    const cfP = crossfadeAudio.play()
-    if (cfP && cfP.catch) cfP.catch(() => {
-      pushProbe('ev:cf-reject', ap)
+    crossfadeAudio.play().catch(() => {
       cleanup(ap, onMediaSessionSync)
     })
-    if (cfP && cfP.then) cfP.then(() => pushProbe('ev:cf-ok', ap))
 
     const duration = Math.max(0.2, Math.min(CROSSFADE_DURATION, remaining)) * 1000
     beginFade(ap, duration)
@@ -495,8 +452,7 @@ export const useCrossfade = () => {
     el.volume = clampVolume(lastGoodVolume * 0.5)
     const start = Date.now()
     const p = el.play()
-    if (p && p.catch) p.catch(() => { pushProbe('ev:ov-reject', ap) })
-    if (p && p.then) p.then(() => pushProbe('ev:ov-ok', ap))
+    if (p && p.catch) p.catch(() => { })
 
     if (immediate) {
       setPlayerVolume(ap, 0, 8000)
@@ -525,8 +481,6 @@ export const useCrossfade = () => {
   const setupCrossfade = (ap, onMediaSessionSync) => {
     let crossfadeTriggered = false
     interceptSetAudio(ap, onMediaSessionSync)
-
-    setInterval(() => pushProbe('tick', ap), 250)
 
    ap.on('volumechange', () => {
       if (Date.now() < (ap._mikuSuppressVolumeSaveUntil || 0)) return
