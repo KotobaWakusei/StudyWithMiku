@@ -628,7 +628,6 @@ const sendSticker = (id) => {
     emit('login')
     return
   }
-  if (!props.isConnected || !props.isAuthenticated) return
   const payload = buildStickerMessage(id)
   if (!payload) return
   if (props.sendMessage(payload, geoLocation.value)) {

@@ -104,7 +104,9 @@ export function useOnlineCount(wsUrl, options = {}) {
     const normalized = String(content || '').trim()
     if (!normalized) return false
     chatError.value = ''
-    return sendMessage({ type: 'chat', content: normalized, location })
+    const ok = sendMessage({ type: 'chat', content: normalized, location })
+    if (!ok) chatError.value = '发送失败：连接已断开，请稍后重试'
+    return ok
   }
 
   const connect = () => {
@@ -133,10 +135,7 @@ export function useOnlineCount(wsUrl, options = {}) {
             const incoming = Array.isArray(data.messages)
               ? data.messages.map(normalizeChatMessage).filter(Boolean)
               : []
-            const next = dedupAndSort(incoming)
-            if (JSON.stringify(next) !== JSON.stringify(messages.value)) {
-              messages.value = next
-            }
+            messages.value = dedupAndSort([...incoming, ...messages.value])
             hasMoreHistory.value = !!data.hasMore
             isLoadingHistory.value = false
             pendingLoadCursor = null
