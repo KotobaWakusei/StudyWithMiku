@@ -21,22 +21,40 @@ const defaultSettings = {
   }
 }
 
+const asObject = (value) => (
+  value && typeof value === 'object' && !Array.isArray(value) ? value : {}
+)
+
+// Merge each settings section independently so older/partial saved settings
+// retain defaults for fields that were added in later versions.
+const mergeSettings = (base, overrides) => {
+  const safeOverrides = asObject(overrides)
+  return {
+    ...base,
+    ...safeOverrides,
+    pomodoro: { ...base.pomodoro, ...asObject(safeOverrides.pomodoro) },
+    video: { ...base.video, ...asObject(safeOverrides.video) },
+    music: { ...base.music, ...asObject(safeOverrides.music) },
+  }
+}
+
 export const getSettings = () => {
   try {
     const stored = localStorage.getItem(STORAGE_KEY)
     if (stored) {
-      return { ...defaultSettings, ...JSON.parse(stored) }
+      return mergeSettings(defaultSettings, JSON.parse(stored))
     }
   } catch (e) {
     console.error('Failed to load settings:', e)
   }
-  return { ...defaultSettings }
+  // Return fresh nested objects rather than references to module defaults.
+  return mergeSettings(defaultSettings, {})
 }
 
 export const saveSettings = (settings) => {
   try {
     const current = getSettings()
-    const merged = { ...current, ...settings }
+    const merged = mergeSettings(current, settings)
     localStorage.setItem(STORAGE_KEY, JSON.stringify(merged))
   } catch (e) {
     console.error('Failed to save settings:', e)
@@ -120,7 +138,7 @@ export const saveOverlayOpacity = (opacity) => {
 
 export const saveMusicIndex = (index) => {
   const settings = getSettings()
-  settings.music = { currentSongIndex: index }
+  settings.music = { ...settings.music, currentSongIndex: index }
   saveSettings(settings)
 }
 
