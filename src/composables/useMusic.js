@@ -9,6 +9,9 @@ const playlistId = ref(localStorage.getItem('playlist_id') || DEFAULT_PLAYLIST_I
 const platform = ref(localStorage.getItem('music_platform') || 'netease')
 const bitrate = ref(localStorage.getItem('music_bitrate') || DEFAULT_BITRATE)
 
+// Only the most recently requested playlist may update shared music state.
+let loadRequestId = 0
+
 const PLATFORMS = [
   { value: 'netease', label: '网易云' },
   { value: 'tencent', label: 'QQ音乐' },
@@ -56,19 +59,25 @@ const removeCustomPlaylist = (p, id) => {
 export const useMusic = () => {
 
   const loadMetingSongs = async (platform, id) => {
+    const requestId = ++loadRequestId
     loading.value = true
+
     try {
       let playlist
       if (platform === 'local') {
         playlist = localSongsData[id] || []
       } else {
         playlist = await fetchPlaylist(platform, id, bitrate.value)
-        
+
         if (id === '8894040639' && platform === 'netease') {
           const specialMusicSongs = localSongsData.special_music || []
           playlist = [...playlist, ...specialMusicSongs]
         }
       }
+
+      // A newer selection was made while this request was in flight.
+      if (requestId !== loadRequestId) return false
+
       if (playlist.length > 0) {
         songs.value = playlist
         saveConfig(platform, id)
@@ -76,9 +85,14 @@ export const useMusic = () => {
         return true
       }
     } catch (error) {
-      console.error('Load meting songs error:', error)
+      if (requestId === loadRequestId) {
+        console.error('Load meting songs error:', error)
+      }
     } finally {
-      loading.value = false
+      // An older request must not clear the loading indicator for a newer one.
+      if (requestId === loadRequestId) {
+        loading.value = false
+      }
     }
     return false
   }
